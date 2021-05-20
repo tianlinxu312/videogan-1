@@ -3,11 +3,14 @@ Author: Vignesh Gokul
 Code structure inspired from https://github.com/carpedm20/DCGAN-tensorflow
 """
 
-import tensorflow as tf
 import numpy as np
 import glob
 from utils import *
 import sys
+import tensorflow.compat.v1 as tf
+# tf.disable_v2_behavior()
+import tqdm
+
 
 class VideoGAN():
     def __init__(self,sess,video_dim,zdim,batch_size,epochs,checkpoint_file,lambd):
@@ -23,6 +26,9 @@ class VideoGAN():
         self.bd2 = batch_norm(name = "dis2")
         self.bd3 = batch_norm(name = "dis3")
         self.video_dim = video_dim
+        self.channels = self.video_dim[-1]
+        self.image_size = self.video_dim[1]
+        self.time_steps = self.video_dim[0]
         self.zdim = zdim
         self.batch_size = batch_size
         self.epochs = epochs
@@ -43,7 +49,7 @@ class VideoGAN():
         self.g_cost = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits = logits_fake, labels = tf.ones_like(prob_fake))) + self.lambd*tf.norm(self.mask,1)
         self.d_cost = d_real_cost + d_fake_cost
 
-    def train(self):
+    def train(self, dataset):
         gen_var = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,scope="generator")
         dis_var = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,scope="discriminator")
         self.g_opt = tf.train.AdamOptimizer(learning_rate = 0.0002, beta1 = 0.5).minimize(self.g_cost, var_list = gen_var)
@@ -54,34 +60,42 @@ class VideoGAN():
             self.ckpt_file = None
         if self.checkpoint_file:
             saver_ = tf.train.import_meta_graph('./checkpoints/' + self.checkpoint_file + '.meta')
-            saver_.restore(self.sess,tf.train.latest_checkpoint('./checkpoints/'))
-            print "Restored model"
+            saver_.restore(self.sess, tf.train.latest_checkpoint('./checkpoints/'))
+            print("Restored model")
         else:
             tf.global_variables_initializer().run()
-        data_files = glob.glob("./trainvideos/*")
-        print_count = len(data_files)/self.batch_size
+
+        if dataset == "mmnist":
+            sample_size = 8000
+            data_path = "../data/mmnist/mnist_training_set.npy"
+            data_files = np.load(data_path) / 255.0
+            data_files = np.transpose(data_files, (1, 0, 2, 3))
+            data_files = np.reshape(data_files, (sample_size, self.time_steps, self.image_size, self.image_size, self.channels))
+        elif dataset == "kth":
+            sample_size = 540
+        else:
+            sample_size = 900
+
         for epoch in range(self.epochs):
-            for counter in range(len(data_files)/self.batch_size):
-                noise_sample = np.random.normal(-1, 1, size = [visualize_count, self.zdim]).astype(np.float32)
-                noise = np.random.normal(-1, 1, size = [self.batch_size, self.zdim]).astype(np.float32)
+            for counter in range(sample_size // self.batch_size):
                 print("....Iteration....:", counter)
-                batch_files = data_files[counter*self.batch_size:(counter+1)*self.batch_size]
-                videos = read_and_process_video(batch_files,self.batch_size,32)
-                #print videos.shape
-                #process_and_write_video(videos,"true_video" + str(counter))
-                _, dloss = self.sess.run([self.d_opt, self.d_cost], feed_dict = {self.z : noise, self.real_video: videos})
-                _, gloss = self.sess.run([self.g_opt, self.g_cost], feed_dict = {self.z : noise, self.real_video: videos})
-    #            _, gloss = self.sess.run([self.g_opt, self.g_cost], feed_dict = {self.z : noise, self.real_video: videos})
+                videos = 0
+                if dataset == "mmnist":
+                    videos = data_files[counter*self.batch_size:(counter+1)*self.batch_size]
+                elif dataset == "kth":
+                    videos = load_kth_data(self.batch_size, self.image_size, self.time_steps)
+                print(videos.shape)
+                noise = np.random.normal(-1, 1, size=[self.batch_size, self.zdim]).astype(np.float32)
+                _, dloss = self.sess.run([self.d_opt, self.d_cost],
+                                         feed_dict={self.z: noise, self.real_video: videos})
+                _, gloss = self.sess.run([self.g_opt, self.g_cost],
+                                         feed_dict={self.z: noise, self.real_video: videos})
+
                 print("Discriminator Loss: ", dloss)
                 print("Generator Loss", gloss)
-                if np.mod(counter + 1, print_count) == 0:
-                    gen_videos,bg = self.sess.run([self.genvideo,self.bg], feed_dict = {self.zsample : noise_sample})
-                    process_and_write_video(gen_videos,"video" + str(counter))
-                    process_and_write_image(bg,"bg" + str(counter))
-                    print (".....Writing sample generated videos......")
 
-            saver.save(self.sess,'./checkpoints/VideoGAN_{}_{}_{}.ckpt'.format(self.batch_size,epoch,counter))
-            print 'Saved {}'.format(counter)
+            saver.save(self.sess,'./checkpoints/VideoGAN_{}_{}_{}.ckpt'.format(self.batch_size, epoch, counter))
+            print('Saved {}'.format(counter))
 
 
     def generator(self,z,reuse = False):
@@ -96,7 +110,7 @@ class VideoGAN():
             deconvb3 = tf.nn.relu(self.bs3(deconvb3))
             deconvb4 = tf.layers.conv2d_transpose(deconvb3,64,kernel_size=[2,2],strides =[2,2],padding="VALID",name="gen4")
             deconvb4 = tf.nn.relu(self.bs4(deconvb4))
-            deconvb5 = tf.layers.conv2d_transpose(deconvb4,3,kernel_size=[2,2],strides =[2,2],padding="VALID",name="gen5")
+            deconvb5 = tf.layers.conv2d_transpose(deconvb4,self.channels ,kernel_size=[2,2],strides =[2,2],padding="VALID",name="gen5")
             background = tf.nn.tanh(deconvb5)
             #Foreground
             #z  = tf.expand_dims(z,1)
@@ -114,7 +128,7 @@ class VideoGAN():
             mask = tf.layers.conv3d_transpose(deconv4,filters= 1, kernel_size=[4,4,4], strides =[2,2,2],padding ="SAME",use_bias = False,name="gen10")
             mask = tf.nn.sigmoid(mask)
             #Video
-            foreground = tf.layers.conv3d_transpose(deconv4,filters = 3, kernel_size = [4,4,4], strides = [2,2,2], padding ="SAME",use_bias = False,name="gen11")
+            foreground = tf.layers.conv3d_transpose(deconv4,filters = self.channels, kernel_size = [4,4,4], strides = [2,2,2], padding ="SAME",use_bias = False,name="gen11")
             foreground = tf.nn.tanh(foreground)
             #Replicate background and mask
             background = tf.expand_dims(background,1)
@@ -123,7 +137,7 @@ class VideoGAN():
             #Incorporate mask
             video = tf.add(tf.multiply(mask,foreground),tf.multiply(1-mask,background))
             print("Video Shape")
-            print video.get_shape()
+            print(video.get_shape())
             return video,foreground,background,mask
     def discriminator(self,vid,reuse = False):
         with tf.variable_scope("discriminator") as scope:
@@ -155,7 +169,7 @@ class VideoGAN():
             deconvb3 = tf.nn.relu(self.bs3(deconvb3))
             deconvb4 = tf.layers.conv2d_transpose(deconvb3,64,kernel_size=[2,2],strides =[2,2],padding="VALID",name="gen4")
             deconvb4 = tf.nn.relu(self.bs4(deconvb4))
-            deconvb5 = tf.layers.conv2d_transpose(deconvb4,3,kernel_size=[2,2],strides =[2,2],padding="VALID",name="gen5")
+            deconvb5 = tf.layers.conv2d_transpose(deconvb4,self.channels,kernel_size=[2,2],strides =[2,2],padding="VALID",name="gen5")
             background = tf.nn.tanh(deconvb5)
             #Foreground
             #z  = tf.expand_dims(z,1)
@@ -173,7 +187,7 @@ class VideoGAN():
             mask = tf.layers.conv3d_transpose(deconv4,filters= 1, kernel_size=[4,4,4], strides =[2,2,2],padding ="SAME",use_bias = False,name="gen10")
             mask = tf.nn.sigmoid(mask)
             #Video
-            foreground = tf.layers.conv3d_transpose(deconv4,filters = 3, kernel_size = [4,4,4], strides = [2,2,2], padding ="SAME",use_bias = False,name="gen11")
+            foreground = tf.layers.conv3d_transpose(deconv4,filters = self.channels, kernel_size = [4,4,4], strides = [2,2,2], padding ="SAME",use_bias = False,name="gen11")
             foreground = tf.nn.tanh(foreground)
             #Replicate background and mask
             background = tf.expand_dims(background,1)
@@ -182,5 +196,5 @@ class VideoGAN():
             #Incorporate mask
             video = tf.add(tf.multiply(mask,foreground),tf.multiply(1-mask,background))
             print("Video Shape")
-            print video.get_shape()
+            print(video.get_shape())
             return video,background
